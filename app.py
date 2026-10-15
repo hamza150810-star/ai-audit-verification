@@ -137,9 +137,8 @@ if uploaded_file is not None:
                     "evidence before reaching conclusions."
                 )
 
-    except Exception as error:
-        st.error(
-            "The file could not be processed. "
-            "Please check that it is a valid Excel workbook."
-        )
-        st.caption(str(error))
+  
+except Exception as error:
+    st.error("The Excel file could not be processed.")
+    st.write("Technical error details:")
+    st.exception(error)
