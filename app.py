@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -28,13 +29,21 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     try:
-        df = pd.read_excel(uploaded_file)
+        # Read the uploaded Excel workbook
+        df = pd.read_excel(
+            uploaded_file,
+            engine="openpyxl"
+        )
 
         st.subheader("Ledger Preview")
         st.dataframe(df.head(10), use_container_width=True)
 
         if st.button("Analyze Ledger", type="primary"):
 
+            # Clean column names to remove extra spaces
+            df.columns = df.columns.astype(str).str.strip()
+
+            # Check required columns
             required = ["Vendor", "Invoice", "Amount"]
             missing = [
                 col for col in required
@@ -47,30 +56,67 @@ if uploaded_file is not None:
                     + ", ".join(missing)
                 )
                 st.info(
-                    "Your Excel file needs columns named "
-                    "Vendor, Invoice, and Amount."
-                )
-            else:
-                df["Amount"] = pd.to_numeric(
-                    df["Amount"], errors="coerce"
+                    "Your Excel file must contain columns "
+                    "named Vendor, Invoice, and Amount. "
+                    "Column names can have extra spaces, "
+                    "but must otherwise match."
                 )
 
-                df["Duplicate Invoice"] = (
-                    df["Invoice"].notna()
-                    & df["Vendor"].notna()
-                    & df.duplicated(
-                        subset=["Vendor", "Invoice"],
+            else:
+                # Convert amounts into numeric values
+                df["Amount"] = pd.to_numeric(
+                    df["Amount"]
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace(" ", "", regex=False),
+                    errors="coerce"
+                )
+
+                # Identify repeated vendor and invoice combinations
+                vendor = (
+                    df["Vendor"].astype("string").str.strip()
+                )
+                invoice = (
+                    df["Invoice"].astype("string").str.strip()
+                )
+
+                valid_invoice = (
+                    vendor.notna()
+                    & invoice.notna()
+                    & vendor.ne("")
+                    & invoice.ne("")
+                )
+
+                duplicate_mask = pd.Series(
+                    False, index=df.index
+                )
+
+                duplicate_mask.loc[valid_invoice] = (
+                    df.loc[valid_invoice]
+                    .assign(
+                        _Vendor=vendor.loc[valid_invoice],
+                        _Invoice=invoice.loc[valid_invoice]
+                    )
+                    .duplicated(
+                        subset=["_Vendor", "_Invoice"],
                         keep=False
                     )
+                    .to_numpy()
                 )
 
+                df["Duplicate Invoice"] = duplicate_mask
+
+                # Identify high-value transactions
                 df["High Value"] = (
-                    df["Amount"] >= threshold
+                    df["Amount"].notna()
+                    & (df["Amount"] >= threshold)
                 )
 
+                # Describe audit findings
                 df["Audit Finding"] = df.apply(
                     lambda row: "; ".join(
-                        finding for finding, condition in [
+                        finding
+                        for finding, condition in [
                             (
                                 "Potential duplicate invoice",
                                 row["Duplicate Invoice"]
@@ -79,17 +125,23 @@ if uploaded_file is not None:
                                 "High-value transaction",
                                 row["High Value"]
                             )
-                        ] if condition
+                        ]
+                        if condition
                     ),
                     axis=1
                 )
 
+                # Prepare exception report
                 exceptions = df[
                     df["Audit Finding"] != ""
                 ].copy()
 
+                # Display summary metrics
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Total Transactions", len(df))
+
+                col1.metric(
+                    "Total Transactions", len(df)
+                )
                 col2.metric(
                     "Flagged Transactions", len(exceptions)
                 )
@@ -110,6 +162,7 @@ if uploaded_file is not None:
                         use_container_width=True
                     )
 
+                # Generate downloadable Excel report
                 output = BytesIO()
 
                 with pd.ExcelWriter(
@@ -132,20 +185,15 @@ if uploaded_file is not None:
                 )
 
                 st.caption(
-                    "Flags are audit indicators, not proof of "
-                    "fraud or misstatement. Review supporting "
+                    "These flags are audit indicators, not proof "
+                    "of fraud or misstatement. Review supporting "
                     "evidence before reaching conclusions."
                 )
 
-               
-    try:
-        df = pd.read_excel(uploaded_file)
-
-        # Keep your existing file-processing code here
-
     except Exception as error:
-        st.error("The Excel file could not be processed.")
+        st.error(
+            "The Excel file could not be processed. "
+            "Check that it is a valid, unencrypted Excel workbook."
+        )
         st.write("Technical error details:")
         st.exception(error)
-  
-
