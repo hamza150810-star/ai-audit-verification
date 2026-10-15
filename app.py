@@ -116,6 +116,8 @@ def add_table_context(label, dataframe, max_rows=300):
 
 
 add_table_context("GENERAL LEDGER", ledger_df)
+add_table_context("GENERAL LEDGER", ledger_df)
+                                        ^^^^^^^^^
 add_table_context("UTILITY BILLS WORKING", working_df)
 
 # Include uploaded bill/document text where readable.
