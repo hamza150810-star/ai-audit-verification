@@ -6,6 +6,29 @@
 import os
 from openai import OpenAI
 
+import streamlit as st
+import pandas as pd
+import pytesseract
+import fitz
+import io
+import re
+
+from pathlib import Path
+from datetime import datetime
+from PIL import Image, ImageOps, ImageEnhance
+from docx import Document
+
+st.set_page_config(
+    page_title="AI Audit Verification",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("AI Audit Verification System")
+st.write("Upload accounting records and supporting documents.")
+
+st.divider()
+
 st.divider()
 st.header("6. AI Audit Assistant")
 st.write(
