@@ -4,371 +4,529 @@ import pandas as pd
 import pytesseract
 import fitz
 import io
-import json
 import re
 
 from pathlib import Path
 from PIL import Image, ImageOps, ImageEnhance
+from datetime import datetime
 from docx import Document
 
-
-st.set_page_config(
-    page_title="AI Audit Verification",
-    page_icon="📊",
-    layout="wide"
-)
-
+st.set_page_config(page_title="AI Audit Verification", layout="wide")
 st.title("AI Audit Verification System")
-st.write(
-    "Upload accounting records and supporting documents "
-    "for audit assistance."
-)
+st.write("Upload bills and compare them with your accounting records.")
 
 st.warning(
-    "This application assists with audit verification. "
-    "Always verify extracted information against original evidence."
+    "Automated checks are preliminary audit procedures. "
+    "Verify exceptions against original documents before concluding."
 )
 
-# Common supported formats
-TABLE_FORMATS = ["xlsx", "xls", "xlsm", "xlsb", "csv"]
-DOCUMENT_FORMATS = [
+TABLE_TYPES = ["xlsx", "xls", "xlsm", "xlsb", "csv"]
+BILL_TYPES = [
     "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp",
-    "xlsx", "xls", "xlsm", "xlsb", "csv",
-    "docx", "txt", "json"
+    "docx", "txt", "xlsx", "xls", "xlsm", "xlsb", "csv"
 ]
 
 
-def read_table(uploaded_file):
-    """Read common spreadsheet and CSV formats."""
-    extension = Path(uploaded_file.name).suffix.lower()
-    file_bytes = uploaded_file.getvalue()
+def read_table(file):
+    ext = Path(file.name).suffix.lower()
+    data = io.BytesIO(file.getvalue())
 
-    if extension == ".csv":
+    if ext == ".csv":
         try:
-            return pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
+            return pd.read_csv(data, encoding="utf-8-sig")
         except UnicodeDecodeError:
-            return pd.read_csv(
-                io.BytesIO(file_bytes), encoding="latin-1"
-            )
+            data.seek(0)
+            return pd.read_csv(data, encoding="latin-1")
 
-    if extension in [".xlsx", ".xlsm"]:
-        return pd.read_excel(
-            io.BytesIO(file_bytes), engine="openpyxl"
-        )
+    if ext in [".xlsx", ".xlsm"]:
+        return pd.read_excel(data, engine="openpyxl")
+    if ext == ".xls":
+        return pd.read_excel(data, engine="xlrd")
+    if ext == ".xlsb":
+        return pd.read_excel(data, engine="pyxlsb")
 
-    if extension == ".xls":
-        return pd.read_excel(
-            io.BytesIO(file_bytes), engine="xlrd"
-        )
-
-    if extension == ".xlsb":
-        return pd.read_excel(
-            io.BytesIO(file_bytes), engine="pyxlsb"
-        )
-
-    raise ValueError(
-        "Unsupported spreadsheet format. Upload Excel or CSV."
-    )
+    raise ValueError("Unsupported spreadsheet format.")
 
 
 def preprocess_image(image):
-    """Improve image readability before OCR."""
-    image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    image = ImageOps.grayscale(image)
+    image = ImageOps.exif_transpose(image).convert("L")
     image = ImageEnhance.Contrast(image).enhance(1.8)
 
-    # Enlarge small images to help OCR.
     if image.width < 1500:
-        ratio = 1500 / image.width
+        factor = 1500 / image.width
         image = image.resize(
-            (1500, int(image.height * ratio))
+            (1500, int(image.height * factor))
         )
-
     return image
 
 
-def extract_pdf_text(file_bytes):
-    """Read selectable PDF text or use OCR for scanned pages."""
-    text_parts = []
+def get_document_text(file):
+    ext = Path(file.name).suffix.lower()
+    raw = file.getvalue()
 
-    with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
-        for page_number, page in enumerate(pdf, start=1):
-            page_text = page.get_text("text").strip()
+    if ext == ".pdf":
+        pages_text = []
+        with fitz.open(stream=raw, filetype="pdf") as pdf:
+            for page in pdf:
+                text = page.get_text("text").strip()
+                if len(text) < 20:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(2, 2), alpha=False
+                    )
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = pytesseract.image_to_string(
+                        preprocess_image(img)
+                    )
+                pages_text.append(text)
+        return "\n".join(pages_text)
 
-            if len(page_text) < 20:
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(2, 2),
-                    alpha=False
-                )
-                image = Image.open(
-                    io.BytesIO(pix.tobytes("png"))
-                )
-                page_text = pytesseract.image_to_string(
-                    preprocess_image(image)
-                )
+    if ext in [".png", ".jpg", ".jpeg", ".tif", ".tiff",
+               ".bmp", ".webp"]:
+        img = Image.open(io.BytesIO(raw))
+        return pytesseract.image_to_string(preprocess_image(img))
 
-            text_parts.append(
-                f"--- Page {page_number} ---\n{page_text}"
-            )
-
-    return "\n\n".join(text_parts)
-
-
-def extract_document_text(uploaded_file):
-    """Extract text from common audit document formats."""
-    extension = Path(uploaded_file.name).suffix.lower()
-    file_bytes = uploaded_file.getvalue()
-
-    if extension == ".pdf":
-        return extract_pdf_text(file_bytes)
-
-    if extension in [
-        ".png", ".jpg", ".jpeg", ".tif", ".tiff",
-        ".bmp", ".webp"
-    ]:
-        image = Image.open(io.BytesIO(file_bytes))
-        return pytesseract.image_to_string(
-            preprocess_image(image)
-        )
-
-    if extension == ".docx":
-        document = Document(io.BytesIO(file_bytes))
-        paragraphs = [
-            paragraph.text for paragraph in document.paragraphs
-            if paragraph.text.strip()
-        ]
-
-        for table in document.tables:
+    if ext == ".docx":
+        doc = Document(io.BytesIO(raw))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
             for row in table.rows:
-                paragraphs.append(
-                    " | ".join(cell.text for cell in row.cells)
-                )
+                parts.append(" | ".join(c.text for c in row.cells))
+        return "\n".join(parts)
 
-        return "\n".join(paragraphs)
+    if ext == ".txt":
+        return raw.decode("utf-8", errors="replace")
 
-    if extension == ".txt":
-        try:
-            return file_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            return file_bytes.decode("latin-1")
+    if ext in TABLE_TYPES:
+        return read_table(file).to_string(index=False)
 
-    if extension == ".json":
-        return json.dumps(
-            json.loads(file_bytes.decode("utf-8-sig")),
-            indent=2,
-            ensure_ascii=False
-        )
-
-    if extension in TABLE_FORMATS:
-        dataframe = read_table(uploaded_file)
-        return dataframe.to_string(index=False)
-
-    raise ValueError("This file format is not supported.")
+    raise ValueError("Unsupported document format.")
 
 
-def extract_bill_fields(text, filename):
-    """Suggest bill details using simple text patterns."""
+def extract_fields(text, filename):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    combined_text = "\n".join(lines)
+    full = "\n".join(lines)
 
-    provider = ""
-    invoice_number = ""
-    bill_date = ""
-    amount = ""
+    def first_match(pattern):
+        match = re.search(pattern, full, re.IGNORECASE)
+        return match.group(1).strip() if match else ""
 
-    provider_pattern = re.compile(
-        r"(?:provider|company|utility|supplier)\s*[:\-]\s*(.+)",
-        re.IGNORECASE
+    provider = first_match(
+        r"(?:provider|company|utility|supplier)\s*[:\-]\s*([^\n]+)"
     )
-    invoice_pattern = re.compile(
+    reference = first_match(
         r"(?:invoice\s*(?:no|number|#)|bill\s*(?:no|number|#)|"
-        r"reference\s*(?:no|number|#))\s*[:\-]?\s*([A-Z0-9\-\/]+)",
-        re.IGNORECASE
+        r"reference\s*(?:no|number|#)|consumer\s*(?:no|number|#))"
+        r"\s*[:\-]?\s*([A-Z0-9\-\/]+)"
     )
-    date_pattern = re.compile(
-        r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|"
-        r"\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b"
+    date_value = first_match(
+        r"(?:bill date|invoice date|issue date|date)\s*[:\-]?\s*"
+        r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|"
+        r"\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})"
     )
-    amount_pattern = re.compile(
-        r"(?:total\s*(?:amount|due|payable)?|amount\s*due|"
-        r"net\s*payable|grand\s*total)\s*[:\-]?\s*"
-        r"(?:PKR|Rs\.?|₨)?\s*([\d,]+(?:\.\d{1,2})?)",
-        re.IGNORECASE
+    amount = first_match(
+        r"(?:total amount|total due|amount due|net payable|"
+        r"grand total|total payable|payable amount)\s*[:\-]?\s*"
+        r"(?:PKR|Rs\.?|₨)?\s*([\d,]+(?:\.\d{1,2})?)"
     )
 
-    for line in lines:
-        if not provider:
-            match = provider_pattern.search(line)
-            if match:
-                provider = match.group(1).strip()
-
-        if not invoice_number:
-            match = invoice_pattern.search(line)
-            if match:
-                invoice_number = match.group(1).strip()
-
-        if not bill_date:
-            match = date_pattern.search(line)
-            if match:
-                bill_date = match.group(1)
-
-        if not amount:
-            match = amount_pattern.search(line)
-            if match:
-                amount = match.group(1).replace(",", "")
+    # If a clearly labelled amount was not found, suggest the largest
+    # currency-like number. This is only a fallback and needs checking.
+    if not amount:
+        numbers = re.findall(
+            r"(?:Rs\.?|PKR|₨)\s*([\d,]+(?:\.\d{1,2})?)",
+            full,
+            re.IGNORECASE
+        )
+        if numbers:
+            amount = max(
+                numbers,
+                key=lambda x: float(x.replace(",", ""))
+            )
 
     return {
         "File Name": filename,
         "Provider": provider,
-        "Invoice / Reference": invoice_number,
-        "Bill Date": bill_date,
-        "Amount": amount,
-        "Review Status": "Needs manual verification"
+        "Invoice / Reference": reference,
+        "Bill Date": date_value,
+        "Amount": amount
     }
 
 
-# --------------------------------------------------
-# SECTION 1: GENERAL LEDGER
-# --------------------------------------------------
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
-st.header("1. Upload General Ledger")
 
-ledger_file = st.file_uploader(
-    "Select your general ledger",
-    type=TABLE_FORMATS,
-    key="ledger"
-)
-
-if ledger_file:
+def parse_amount(value):
+    if pd.isna(value) or str(value).strip() == "":
+        return None
     try:
-        ledger_df = read_table(ledger_file)
-        st.success("General ledger uploaded successfully.")
-        st.write("Ledger preview:")
-        st.dataframe(ledger_df.head(100), use_container_width=True)
-    except Exception as error:
-        st.error(f"Could not read the ledger: {error}")
+        cleaned = re.sub(r"[^\d.\-]", "", str(value).replace(",", ""))
+        return float(cleaned) if cleaned else None
+    except (ValueError, TypeError):
+        return None
 
 
-# --------------------------------------------------
-# SECTION 2: UTILITY BILL WORKING
-# --------------------------------------------------
+def guess_column(columns, keywords):
+    for col in columns:
+        if any(word in str(col).lower() for word in keywords):
+            return col
+    return "-- Not available --"
 
-st.header("2. Upload Utility Bills Working")
 
-working_file = st.file_uploader(
-    "Select your utility bills working",
-    type=TABLE_FORMATS,
-    key="working"
-)
+def column_picker(df, label, key, keywords, required=False):
+    options = ["-- Not available --"] + list(df.columns)
+    guess = guess_column(df.columns, keywords)
+    default_index = options.index(guess) if guess in options else 0
+    return st.selectbox(
+        label, options, index=default_index, key=key
+    )
 
-if working_file:
-    try:
-        working_df = read_table(working_file)
-        st.success("Utility working uploaded successfully.")
-        st.write("Utility working preview:")
-        st.dataframe(
-            working_df.head(100),
-            use_container_width=True
+
+def match_bill(bill, df, vendor_col, ref_col, amount_col, tolerance):
+    """Return a cautious matching status and candidate row."""
+    if df is None or df.empty or amount_col == "-- Not available --":
+        return "Unable to check", ""
+
+    bill_amount = parse_amount(bill.get("Amount", ""))
+    bill_vendor = clean_text(bill.get("Provider", ""))
+    bill_ref = clean_text(bill.get("Invoice / Reference", ""))
+
+    if bill_amount is None:
+        return "Amount missing - check manually", ""
+
+    candidates = []
+
+    for idx, row in df.iterrows():
+        row_amount = parse_amount(row.get(amount_col))
+        row_vendor = (
+            clean_text(row.get(vendor_col))
+            if vendor_col != "-- Not available --" else ""
         )
-    except Exception as error:
-        st.error(f"Could not read the utility working: {error}")
+        row_ref = (
+            clean_text(row.get(ref_col))
+            if ref_col != "-- Not available --" else ""
+        )
+
+        same_vendor = bool(
+            bill_vendor and row_vendor and (
+                bill_vendor == row_vendor
+                or bill_vendor in row_vendor
+                or row_vendor in bill_vendor
+            )
+        )
+        same_ref = bool(bill_ref and row_ref and bill_ref == row_ref)
+        same_amount = (
+            row_amount is not None
+            and abs(row_amount - bill_amount) <= tolerance
+        )
+
+        # Reference match takes priority, but amount is checked too.
+        if same_ref and (same_vendor or not bill_vendor or not row_vendor):
+            if same_amount:
+                return "Matched", str(idx + 2)
+            return "Reference found - amount mismatch", str(idx + 2)
+
+        if same_vendor and same_amount:
+            candidates.append(str(idx + 2))
+
+    if len(candidates) == 1:
+        return "Possible match - verify reference", candidates[0]
+    if len(candidates) > 1:
+        return "Multiple possible matches", ", ".join(candidates)
+
+    # If the provider was not extracted, an amount alone cannot confirm
+    # a match. Show this explicitly to avoid false conclusions.
+    if not bill_vendor and ref_col == "-- Not available --":
+        return "Not matched - provider/reference unavailable", ""
+
+    return "Not found - investigate", ""
 
 
-# --------------------------------------------------
-# SECTION 3: SUPPORTING DOCUMENTS
-# --------------------------------------------------
+# ---------------- UPLOAD ACCOUNTING RECORDS ----------------
 
-st.header("3. Upload Supporting Bills and Documents")
+st.header("1. Upload Accounting Records")
 
-st.write(
-    "Upload multiple bills together. PDF files, photographs, "
-    "scanned bills, Word documents, text files and spreadsheets "
-    "are supported."
-)
+col1, col2 = st.columns(2)
+
+with col1:
+    ledger_file = st.file_uploader(
+        "General ledger", type=TABLE_TYPES, key="ledger"
+    )
+
+with col2:
+    working_file = st.file_uploader(
+        "Utility bills working", type=TABLE_TYPES, key="working"
+    )
+
+ledger_df = None
+working_df = None
+
+for label, file in [
+    ("General ledger", ledger_file),
+    ("Utility bills working", working_file)
+]:
+    if file:
+        try:
+            loaded = read_table(file)
+            if label == "General ledger":
+                ledger_df = loaded
+            else:
+                working_df = loaded
+            st.success(f"{label} uploaded: {len(loaded)} rows.")
+            with st.expander(f"Preview {label}"):
+                st.dataframe(loaded.head(50), use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not read {label}: {e}")
+
+
+# ---------------- UPLOAD BILLS ----------------
+
+st.header("2. Upload Bill Pictures or Documents")
 
 bill_files = st.file_uploader(
-    "Choose bills or supporting documents",
-    type=DOCUMENT_FORMATS,
+    "Select one or more bill files",
+    type=BILL_TYPES,
     accept_multiple_files=True,
-    key="bills"
+    key="bill_files"
 )
 
-bill_records = []
+records = []
 
 if bill_files:
-    st.info(f"{len(bill_files)} file(s) uploaded.")
-
-    for index, uploaded_file in enumerate(bill_files):
-        with st.expander(
-            f"Document {index + 1}: {uploaded_file.name}",
-            expanded=(index == 0)
-        ):
-            extension = Path(uploaded_file.name).suffix.lower()
-
-            if extension in [
-                ".png", ".jpg", ".jpeg", ".tif", ".tiff",
-                ".bmp", ".webp"
-            ]:
-                st.image(
-                    uploaded_file.getvalue(),
-                    caption=uploaded_file.name,
-                    use_container_width=True
-                )
+    for i, file in enumerate(bill_files):
+        with st.expander(file.name, expanded=(i == 0)):
+            ext = Path(file.name).suffix.lower()
+            if ext in [".png", ".jpg", ".jpeg", ".tif", ".tiff",
+                       ".bmp", ".webp"]:
+                st.image(file.getvalue(), use_container_width=True)
 
             try:
-                extracted_text = extract_document_text(uploaded_file)
-
+                text = get_document_text(file)
                 st.text_area(
-                    "Extracted text — check it against the original",
-                    value=extracted_text,
-                    height=220,
-                    key=f"text_{index}"
+                    "Text read from document",
+                    text,
+                    height=150,
+                    key=f"ocr_{i}"
                 )
+                records.append(extract_fields(text, file.name))
+            except Exception as e:
+                st.error(f"Could not read {file.name}: {e}")
 
-                record = extract_bill_fields(
-                    extracted_text, uploaded_file.name
-                )
-                bill_records.append(record)
-
-                st.write("Suggested bill details")
-                st.json(record)
-
-            except Exception as error:
-                st.error(
-                    f"Could not process this file: {error}"
-                )
-
-if bill_records:
-    st.header("4. Review Extracted Bill Register")
-
-    register_df = pd.DataFrame(bill_records)
-
+if records:
+    st.header("3. Review Extracted Bill Details")
     st.write(
-        "Correct any missing or inaccurate values before using "
-        "this register for audit work."
+        "Correct the extracted fields before running reconciliation. "
+        "OCR can misread dates, invoice numbers and amounts."
     )
-
-    edited_df = st.data_editor(
-        register_df,
+    bills_df = pd.DataFrame(records)
+    edited_bills = st.data_editor(
+        bills_df,
         num_rows="dynamic",
         use_container_width=True,
-        key="bill_register"
+        key="edited_bills"
     )
 
-    csv_data = edited_df.to_csv(index=False).encode("utf-8-sig")
+    st.header("4. Match Bills Against Your Records")
 
-    st.download_button(
-        "Download Bill Register (CSV)",
-        data=csv_data,
-        file_name="extracted_bill_register.csv",
-        mime="text/csv"
+    tolerance = st.number_input(
+        "Amount difference allowed for a possible match",
+        min_value=0.0,
+        value=1.0,
+        step=1.0
     )
+
+    basis = st.radio(
+        "Accounting basis used by the client",
+        ["Accrual basis", "Cash basis", "Not sure"],
+        horizontal=True
+    )
+
+    def configure_mapping(df, prefix):
+        if df is None:
+            return ("-- Not available --",) * 3
+
+        st.subheader(prefix + " column mapping")
+        st.caption("Choose the columns that contain these values.")
+        a, b, c = st.columns(3)
+
+        with a:
+            vendor = column_picker(
+                df, "Vendor / utility provider", prefix + "_vendor",
+                ["vendor", "supplier", "provider", "utility", "payee",
+                 "particular", "description", "name"]
+            )
+        with b:
+            ref = column_picker(
+                df, "Invoice / bill reference", prefix + "_ref",
+                ["invoice", "bill no", "reference", "ref no", "consumer"]
+            )
+        with c:
+            amount = column_picker(
+                df, "Amount", prefix + "_amount",
+                ["amount", "debit", "credit", "gross", "total", "value"]
+            )
+
+        return vendor, ref, amount
+
+    if ledger_df is not None:
+        ledger_vendor, ledger_ref, ledger_amount = configure_mapping(
+            ledger_df, "General ledger"
+        )
+    else:
+        ledger_vendor, ledger_ref, ledger_amount = (
+            "-- Not available --",
+        ) * 3
+
+    if working_df is not None:
+        work_vendor, work_ref, work_amount = configure_mapping(
+            working_df, "Utility bills working"
+        )
+    else:
+        work_vendor, work_ref, work_amount = (
+            "-- Not available --",
+        ) * 3
+
+    if st.button("Run Bill Verification", type="primary"):
+        results = []
+        duplicate_keys = {}
+
+        # Flag duplicate uploaded documents using provider + reference.
+        for idx, bill in edited_bills.iterrows():
+            provider = clean_text(bill.get("Provider", ""))
+            reference = clean_text(bill.get("Invoice / Reference", ""))
+            amount = parse_amount(bill.get("Amount", ""))
+            date_value = clean_text(bill.get("Bill Date", ""))
+
+            if provider and reference:
+                key = ("ref", provider, reference)
+            elif provider and amount is not None and date_value:
+                key = ("date_amount", provider, amount, date_value)
+            else:
+                key = None
+
+            duplicate_keys[idx] = key
+
+        counts = {}
+        for key in duplicate_keys.values():
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+
+        for idx, bill in edited_bills.iterrows():
+            ledger_status, ledger_rows = match_bill(
+                bill, ledger_df, ledger_vendor, ledger_ref,
+                ledger_amount, tolerance
+            )
+
+            working_status, working_rows = match_bill(
+                bill, working_df, work_vendor, work_ref,
+                work_amount, tolerance
+            )
+
+            key = duplicate_keys[idx]
+            duplicate_status = (
+                "Possible duplicate upload"
+                if key and counts.get(key, 0) > 1
+                else "No duplicate detected"
+            )
+
+            if ledger_status == "Matched":
+                overall = "Matched in ledger"
+            elif "mismatch" in ledger_status.lower():
+                overall = "Investigate amount mismatch"
+            elif duplicate_status == "Possible duplicate upload":
+                overall = "Investigate possible duplicate"
+            elif ledger_status.startswith("Not found"):
+                overall = "Potential unrecorded bill - investigate"
+            else:
+                overall = "Needs further review"
+
+            results.append({
+                **bill.to_dict(),
+                "Ledger Status": ledger_status,
+                "Ledger Candidate Row(s)": ledger_rows,
+                "Working Status": working_status,
+                "Working Candidate Row(s)": working_rows,
+                "Duplicate Check": duplicate_status,
+                "Overall Result": overall
+            })
+
+        results_df = pd.DataFrame(results)
+        st.session_state["verification_results"] = results_df
+        st.session_state["verification_basis"] = basis
+
+    if "verification_results" in st.session_state:
+        results_df = st.session_state["verification_results"]
+
+        st.subheader("Verification Results")
+        st.dataframe(results_df, use_container_width=True)
+
+        st.download_button(
+            "Download Verification Report (CSV)",
+            results_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="bill_verification_report.csv",
+            mime="text/csv"
+        )
+
+        st.header("5. Draft Journal Entries for Review")
+
+        potential = results_df[
+            results_df["Ledger Status"].str.startswith(
+                "Not found", na=False
+            )
+            & (results_df["Duplicate Check"] != "Possible duplicate upload")
+        ].copy()
+
+        potential["Amount Numeric"] = potential["Amount"].apply(parse_amount)
+        potential = potential[potential["Amount Numeric"].notna()]
+
+        if potential.empty:
+            st.info(
+                "No bills currently meet the draft-entry criteria. "
+                "This does not prove that all bills are correctly recorded."
+            )
+        elif st.session_state.get("verification_basis") == "Accrual basis":
+            st.warning(
+                "These are draft proposals only. Confirm the service period, "
+                "liability, prior postings, materiality and applicable "
+                "accounting framework before using any entry."
+            )
+
+            entries = []
+            for _, bill in potential.iterrows():
+                amount = bill["Amount Numeric"]
+                entries.append({
+                    "Bill": bill["File Name"],
+                    "Date": bill["Bill Date"],
+                    "Account Dr": "Relevant Utility Expense",
+                    "Account Cr": "Accrued Utility Expenses / Payable",
+                    "Debit": amount,
+                    "Credit": amount,
+                    "Status": "Draft - requires auditor approval"
+                })
+
+            entries_df = pd.DataFrame(entries)
+            st.dataframe(entries_df, use_container_width=True)
+
+            st.download_button(
+                "Download Draft Journal Entries",
+                entries_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="draft_journal_entries.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info(
+                "No accrual journal entries have been proposed because "
+                "the selected basis is cash basis or not confirmed. "
+                "Investigate payment timing and the client's applicable "
+                "accounting requirements before deciding on an adjustment."
+            )
 
 st.divider()
 st.caption(
-    "Note: OCR and automatic field extraction may be inaccurate. "
-    "This version uploads and extracts documents; it does not yet "
-    "automatically reconcile every extracted bill against the ledger "
-    "or generate final journal entries."
+    "Matching uses selected columns, reference numbers, provider names "
+    "and amount tolerance. Candidate row numbers refer to spreadsheet "
+    "row positions, not verified invoice IDs. A match is not proof of "
+    "validity, and a non-match is not proof of an omission."
 )
