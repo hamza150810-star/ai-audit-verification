@@ -3,6 +3,9 @@ streamlit
 pandas
 openpyxl
 xlsxwriter
+xlrd
+pyxlsb
 pytesseract
 Pillow
 PyMuPDF
+python-docx
