@@ -137,8 +137,15 @@ if uploaded_file is not None:
                     "evidence before reaching conclusions."
                 )
 
+               
+    try:
+        df = pd.read_excel(uploaded_file)
+
+        # Keep your existing file-processing code here
+
+    except Exception as error:
+        st.error("The Excel file could not be processed.")
+        st.write("Technical error details:")
+        st.exception(error)
   
-except Exception as error:
-    st.error("The Excel file could not be processed.")
-    st.write("Technical error details:")
-    st.exception(error)
+
