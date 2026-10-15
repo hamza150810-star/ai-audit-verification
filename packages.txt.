@@ -1,8 +1,2 @@
 
-streamlit
-pandas
-openpyxl
-xlsxwriter
-pytesseract
-Pillow
-PyMuPDF
+tesseract-ocr
