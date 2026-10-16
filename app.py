@@ -1,4 +1,58 @@
 
+st.subheader("Automatic Ledger Analysis")
+
+if ledger_df is not None and not ledger_df.empty:
+    try:
+        auto_ledger, detected_columns = prepare_detected_ledger(
+            ledger_df
+        )
+
+        st.success("Ledger columns detected automatically.")
+
+        detected_rows = []
+
+        for field, details in detected_columns.items():
+            detected_rows.append({
+                "Field": field.replace("_", " ").title(),
+                "Detected Column": (
+                    str(details["column"])
+                    if details["column"] is not None
+                    else "Not detected"
+                ),
+                "Confidence": (
+                    "Review"
+                    if details["ambiguous"]
+                    else "Candidate identified"
+                    if details["column"] is not None
+                    else "Missing"
+                )
+            })
+
+        st.dataframe(
+            pd.DataFrame(detected_rows),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "The app selects columns automatically. It flags uncertain "
+            "matches so the wrong column is not silently treated as correct."
+        )
+
+        if st.button(
+            "Generate Sampling Workbook Automatically",
+            type="primary"
+        ):
+            st.info(
+                "Pass auto_ledger['_Auto_Account'] as the account-head "
+                "field and auto_ledger['_Auto_Amount'] as the amount field "
+                "to the sampling generator. Use the detected date, voucher "
+                "and description fields for the audit trail."
+            )
+
+    except Exception as exc:
+        st.error(f"Automatic ledger detection failed: {exc}")
+
 import re
 import pandas as pd
 
