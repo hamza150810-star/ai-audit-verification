@@ -23,8 +23,7 @@ st.set_page_config(
 
 st.title("AI Audit Verification")
 st.caption(
-    "Automatically analyse a General Ledger, identify account heads, "
-    "select audit samples, and export an Excel workbook."
+    "Automatic General Ledger analysis and audit sampling workbook generator"
 )
 
 
@@ -33,7 +32,6 @@ st.caption(
 # ============================================================
 
 def normalise_text(value):
-    """Standardise text for matching headers and account names."""
     if value is None:
         return ""
 
@@ -43,8 +41,8 @@ def normalise_text(value):
 
 
 def parse_numeric(value):
-    """Convert common accounting number formats into numeric values."""
-    if pd.isna(value):
+    """Convert common accounting number formats to numeric values."""
+    if value is None or pd.isna(value):
         return 0.0
 
     if isinstance(value, (int, float)):
@@ -65,12 +63,42 @@ def parse_numeric(value):
     try:
         number = float(text)
         return -abs(number) if negative else number
-    except ValueError:
+    except (ValueError, TypeError):
         return 0.0
 
 
+def safe_datetime_series(series):
+    """
+    Parse mixed date formats and time zones safely.
+
+    utc=True normalises timezone-aware values and allows mixed
+    timezone inputs to be processed consistently.
+    """
+    try:
+        return pd.to_datetime(
+            series,
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        )
+    except (TypeError, ValueError):
+        # Compatibility fallback for older pandas versions.
+        try:
+            return pd.to_datetime(
+                series,
+                errors="coerce",
+                utc=True,
+            )
+        except (TypeError, ValueError):
+            return pd.Series(
+                pd.NaT,
+                index=series.index,
+                dtype="datetime64[ns, UTC]",
+            )
+
+
 def read_uploaded_ledger(uploaded_file):
-    """Read an Excel or CSV ledger."""
+    """Read Excel or CSV General Ledger files."""
     if uploaded_file is None:
         return None
 
@@ -81,15 +109,18 @@ def read_uploaded_ledger(uploaded_file):
         try:
             return pd.read_csv(io.BytesIO(data))
         except UnicodeDecodeError:
-            return pd.read_csv(io.BytesIO(data), encoding="latin1")
+            return pd.read_csv(
+                io.BytesIO(data),
+                encoding="latin1",
+            )
 
-    if name.endswith((".xlsx", ".xlsm")):
-        return pd.read_excel(io.BytesIO(data), sheet_name=0)
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(
+            io.BytesIO(data),
+            sheet_name=0,
+        )
 
-    if name.endswith(".xls"):
-        return pd.read_excel(io.BytesIO(data), sheet_name=0)
-
-    raise ValueError("Upload an Excel or CSV General Ledger file.")
+    raise ValueError("Please upload an Excel or CSV ledger.")
 
 
 # ============================================================
@@ -100,9 +131,9 @@ HEADER_ALIASES = {
     "account_name": [
         "account name", "ledger name", "ledger account",
         "account head", "expense head", "account title",
-        "account description", "gl description",
-        "gl name", "name of account", "ledger description",
-        "particulars", "account"
+        "account description", "gl description", "gl name",
+        "name of account", "ledger description", "particulars",
+        "account"
     ],
     "account_code": [
         "account code", "gl code", "ledger code",
@@ -111,7 +142,7 @@ HEADER_ALIASES = {
     "amount": [
         "amount", "transaction amount", "local amount",
         "net amount", "transaction value", "value",
-        "debit credit amount", "total amount"
+        "total amount"
     ],
     "debit": [
         "debit", "debit amount", "dr amount",
@@ -160,12 +191,22 @@ def numeric_ratio(series):
     if values.empty:
         return 0.0
 
-    parsed = values.map(parse_numeric)
-    return float(parsed.notna().mean())
+    numeric_count = sum(
+        isinstance(value, (int, float))
+        or bool(
+            re.fullmatch(
+                r"[\s$£€\-+()]?\d[\d,]*(\.\d+)?[\s$£€()]?",
+                str(value).strip(),
+            )
+        )
+        for value in values
+    )
+
+    return numeric_count / len(values)
 
 
 def detect_ledger_columns(df):
-    """Choose likely columns using header names and column contents."""
+    """Detect likely ledger columns from headers and data."""
     if df is None or df.empty:
         raise ValueError("The uploaded General Ledger is empty.")
 
@@ -179,47 +220,45 @@ def detect_ledger_columns(df):
             values = df[column].dropna()
 
             if field in {"amount", "debit", "credit"}:
-                if not values.empty:
-                    numeric_share = sum(
-                        1 for value in values
-                        if isinstance(value, (int, float))
-                        or bool(
-                            re.fullmatch(
-                                r"[\s$£€\-+()]?\d[\d,]*(\.\d+)?[\s$£€()]?",
-                                str(value).strip()
-                            )
-                        )
-                    ) / len(values)
+                ratio = numeric_ratio(values)
 
-                    if numeric_share >= 0.70:
-                        score += 20
+                if ratio >= 0.70:
+                    score += 20
+                elif ratio >= 0.40:
+                    score += 8
 
-            if field == "date" and not values.empty:
-                date_share = pd.to_datetime(
-                    values, errors="coerce"
-                ).notna().mean()
+            elif field == "date" and not values.empty:
+                # FIX: utc=True handles mixed time zones.
+                parsed_dates = safe_datetime_series(values)
+                date_ratio = parsed_dates.notna().mean()
 
-                if date_share >= 0.70:
+                if date_ratio >= 0.70:
                     score += 20
 
-            if field in {"account_name", "description"}:
+            elif field in {"account_name", "description"}:
                 if not values.empty:
-                    nonnumeric_share = (
+                    text_ratio = (
                         ~values.astype(str).str.fullmatch(
                             r"[-+]?\d[\d,]*(\.\d+)?"
                         )
                     ).mean()
-                    score += int(nonnumeric_share * 10)
+
+                    score += int(text_ratio * 10)
 
             if score > 0:
                 candidates.append((score, column))
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
 
         if candidates:
             best_score, best_column = candidates[0]
             second_score = (
-                candidates[1][0] if len(candidates) > 1 else 0
+                candidates[1][0]
+                if len(candidates) > 1
+                else 0
             )
 
             detected[field] = {
@@ -237,7 +276,6 @@ def detect_ledger_columns(df):
                 "ambiguous": False,
             }
 
-    # Account-code fallback if no account-name column was identified.
     if detected["account_name"]["column"] is None:
         detected["account_name"] = detected["account_code"].copy()
 
@@ -245,7 +283,7 @@ def detect_ledger_columns(df):
 
 
 def prepare_detected_ledger(df):
-    """Add standardised audit fields without deleting original columns."""
+    """Standardise ledger fields without removing source columns."""
     result = df.copy()
     detected = detect_ledger_columns(result)
 
@@ -256,7 +294,8 @@ def prepare_detected_ledger(df):
 
     if account_col is None:
         raise ValueError(
-            "Account-head column not detected. Check the ledger headers."
+            "Account-head column could not be detected. "
+            "Check the ledger headers."
         )
 
     if amount_col is not None:
@@ -268,13 +307,13 @@ def prepare_detected_ledger(df):
             if debit_col is not None
             else pd.Series(0.0, index=result.index)
         )
+
         credit = (
             result[credit_col].map(parse_numeric)
             if credit_col is not None
             else pd.Series(0.0, index=result.index)
         )
 
-        # Debit-positive convention for net transaction value.
         result["_Audit_Amount"] = debit - credit
 
     else:
@@ -283,17 +322,23 @@ def prepare_detected_ledger(df):
         )
 
     result["_Audit_Account"] = (
-        result[account_col].fillna("").astype(str).str.strip()
+        result[account_col]
+        .fillna("")
+        .astype(str)
+        .str.strip()
     )
+
     result["_Audit_Source_Row"] = range(2, len(result) + 2)
 
     for field in ["date", "voucher", "description"]:
         source_column = detected[field]["column"]
+
         result[f"_Audit_{field.title()}"] = (
-            result[source_column] if source_column is not None else ""
+            result[source_column]
+            if source_column is not None
+            else ""
         )
 
-    # Remove blank account rows and rows without meaningful transactions.
     result = result[
         result["_Audit_Account"].ne("")
     ].copy()
@@ -302,28 +347,28 @@ def prepare_detected_ledger(df):
 
 
 # ============================================================
-# AUDIT HEAD CLASSIFICATION AND SAMPLING
+# FULL-VERIFICATION ACCOUNT HEADS
 # ============================================================
 
 FULL_VERIFICATION_KEYWORDS = {
     "Utilities": [
-        "utility", "utilities", "electricity", "lesco", "iesco",
-        "mepco", "electric bill", "water bill", "wasa",
-        "sui gas", "gas bill", "telephone", "internet"
+        "utility", "utilities", "electricity", "lesco",
+        "iesco", "mepco", "electric bill", "water bill",
+        "wasa", "sui gas", "gas bill", "telephone", "internet"
     ],
     "Fee and Subscription": [
         "fee and subscription", "fees and subscription",
-        "subscription", "membership fee", "professional membership",
-        "fee subscription"
+        "subscription", "membership fee",
+        "professional membership", "fee subscription"
     ],
     "Legal and Professional Charges": [
         "legal and professional", "legal charges",
-        "professional charges", "legal fee", "consultancy fee",
-        "consultancy charges", "audit fee"
+        "professional charges", "legal fee",
+        "consultancy fee", "consultancy charges", "audit fee"
     ],
     "Salaries": [
-        "salary", "salaries", "payroll", "staff remuneration",
-        "employees remuneration", "wages"
+        "salary", "salaries", "payroll",
+        "staff remuneration", "employees remuneration", "wages"
     ],
     "Depreciation": [
         "depreciation", "depreciation expense",
@@ -333,7 +378,6 @@ FULL_VERIFICATION_KEYWORDS = {
 
 
 def classify_full_verification(account_name, extra_heads=None):
-    """Return the matching full-verification category, if any."""
     account = normalise_text(account_name)
 
     for category, keywords in FULL_VERIFICATION_KEYWORDS.items():
@@ -342,11 +386,17 @@ def classify_full_verification(account_name, extra_heads=None):
                 return category
 
     for head in extra_heads or []:
-        if normalise_text(head) and normalise_text(head) in account:
+        normalised_head = normalise_text(head)
+
+        if normalised_head and normalised_head in account:
             return head
 
     return None
 
+
+# ============================================================
+# SAMPLING
+# ============================================================
 
 def build_sampling_data(
     ledger,
@@ -355,12 +405,14 @@ def build_sampling_data(
     extra_heads=None,
     seed=42,
 ):
-    """Create full-verification and risk-based sample populations."""
     df = ledger.copy()
 
-    df["_Full_Verification_Category"] = df["_Audit_Account"].map(
+    df["_Full_Verification_Category"] = df[
+        "_Audit_Account"
+    ].map(
         lambda account: classify_full_verification(
-            account, extra_heads=extra_heads
+            account,
+            extra_heads=extra_heads,
         )
     )
 
@@ -375,13 +427,12 @@ def build_sampling_data(
     ].copy()
 
     selected_indices = []
-
-    # Sample within each remaining account head.
     rng = random.Random(seed)
 
-    for _, group in remaining.groupby("_Audit_Account", dropna=False):
-        group = group.copy()
-
+    for _, group in remaining.groupby(
+        "_Audit_Account",
+        dropna=False,
+    ):
         if group.empty:
             continue
 
@@ -393,33 +444,44 @@ def build_sampling_data(
 
         if include_high_value:
             group = group.sort_values(
-                "_Absolute_Amount", ascending=False
+                "_Absolute_Amount",
+                ascending=False,
             )
-            chosen = list(group.head(min(sample_count, len(group))).index)
 
-            # Randomly fill any remaining sample slots.
+            chosen = list(
+                group.head(sample_count).index
+            )
+
             if len(chosen) < sample_count:
                 remaining_indices = [
-                    idx for idx in group.index if idx not in chosen
+                    idx for idx in group.index
+                    if idx not in chosen
                 ]
+
                 chosen.extend(
                     rng.sample(
                         remaining_indices,
-                        min(sample_count - len(chosen), len(remaining_indices)),
+                        min(
+                            sample_count - len(chosen),
+                            len(remaining_indices),
+                        ),
                     )
                 )
         else:
             chosen = rng.sample(
-                list(group.index), sample_count
+                list(group.index),
+                sample_count,
             )
 
         selected_indices.extend(chosen)
 
-    sample_selected = remaining.loc[selected_indices].copy()
+    sample_selected = remaining.loc[
+        selected_indices
+    ].copy()
 
-    # Keep the remaining, non-selected transactions for population review.
     population_not_selected = remaining.drop(
-        index=selected_indices, errors="ignore"
+        index=selected_indices,
+        errors="ignore",
     ).copy()
 
     summary = (
@@ -433,73 +495,47 @@ def build_sampling_data(
         .rename(columns={"_Audit_Account": "Account Head"})
     )
 
-    full_summary = (
-        full_verification.groupby(
-            ["_Audit_Account", "_Full_Verification_Category"],
-            dropna=False,
-        )
-        .agg(
-            Items_Selected=("_Audit_Account", "size"),
-            Amount_Selected=("_Audit_Amount", "sum"),
-        )
-        .reset_index()
-        .rename(
-            columns={
-                "_Audit_Account": "Account Head",
-                "_Full_Verification_Category": "Verification Category",
-            }
-        )
-    )
-
-    sample_summary = (
-        sample_selected.groupby("_Audit_Account", dropna=False)
-        .agg(
-            Items_Selected=("_Audit_Account", "size"),
-            Amount_Selected=("_Audit_Amount", "sum"),
-        )
-        .reset_index()
-        .rename(columns={"_Audit_Account": "Account Head"})
-    )
-
     return (
         full_verification,
         sample_selected,
         population_not_selected,
         summary,
-        full_summary,
-        sample_summary,
     )
 
 
 # ============================================================
-# EXCEL FORMATTING AND EXPORT
+# EXCEL OUTPUT
 # ============================================================
 
 def dataframe_for_export(df):
-    """Remove internal helper columns from user-facing output."""
-    result = df.copy()
-
-    helper_columns = [
-        col for col in result.columns
-        if col.startswith("_Audit_")
-    ]
-    result = result.drop(columns=helper_columns, errors="ignore")
-
-    return result
+    return df.drop(
+        columns=[
+            col for col in df.columns
+            if col.startswith("_Audit_")
+            or col == "_Absolute_Amount"
+        ],
+        errors="ignore",
+    ).copy()
 
 
 def style_worksheet(ws):
-    """Apply simple professional formatting."""
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+
+    if ws.max_row >= 1 and ws.max_column >= 1:
+        ws.auto_filter.ref = ws.dimensions
 
     header_fill = PatternFill(
-        fill_type="solid", fgColor="17365D"
+        fill_type="solid",
+        fgColor="17365D",
     )
     header_font = Font(
-        bold=True, color="FFFFFF"
+        bold=True,
+        color="FFFFFF",
     )
-    thin_grey = Side(style="thin", color="D9E2F3")
+    thin_grey = Side(
+        style="thin",
+        color="D9E2F3",
+    )
 
     for cell in ws[1]:
         cell.fill = header_fill
@@ -512,20 +548,19 @@ def style_worksheet(ws):
         cell.border = Border(bottom=thin_grey)
 
     for column_cells in ws.columns:
-        column_letter = get_column_letter(column_cells[0].column)
+        letter = get_column_letter(column_cells[0].column)
         max_length = 0
 
         for cell in column_cells:
-            try:
+            if cell.value is not None:
                 max_length = max(
                     max_length,
-                    len(str(cell.value)) if cell.value is not None else 0,
+                    len(str(cell.value)),
                 )
-            except Exception:
-                pass
 
-        ws.column_dimensions[column_letter].width = min(
-            max(max_length + 2, 12), 38
+        ws.column_dimensions[letter].width = min(
+            max(max_length + 2, 12),
+            40,
         )
 
     ws.row_dimensions[1].height = 30
@@ -538,24 +573,22 @@ def build_audit_sampling_workbook(
     include_high_value=True,
     extra_heads=None,
 ):
-    """Preserve reference workbook sheets and append audit output sheets."""
     if not reference_bytes:
-        raise ValueError("Upload the reference sampling workbook.")
+        raise ValueError(
+            "Upload the reference sampling workbook."
+        )
 
     ledger, detected = prepare_detected_ledger(ledger_df)
 
-    full, selected, not_selected, summary, full_summary, sample_summary = (
-        build_sampling_data(
-            ledger,
-            sample_percentage=sample_percentage,
-            include_high_value=include_high_value,
-            extra_heads=extra_heads,
-        )
+    full, selected, not_selected, summary = build_sampling_data(
+        ledger,
+        sample_percentage=sample_percentage,
+        include_high_value=include_high_value,
+        extra_heads=extra_heads,
     )
 
     workbook = load_workbook(io.BytesIO(reference_bytes))
 
-    # Replace only output sheets generated by this app.
     output_names = [
         "Auto Summary",
         "100% Verification",
@@ -573,46 +606,73 @@ def build_audit_sampling_workbook(
         ws = workbook.create_sheet(sheet_name)
         export_df = dataframe_for_export(df)
 
-        for row in [list(export_df.columns)] + export_df.astype(object).values.tolist():
-            cleaned_row = []
-            for value in row:
-                if pd.isna(value):
-                    cleaned_row.append(None)
+        ws.append(list(export_df.columns))
+
+        for values in export_df.itertuples(
+            index=False,
+            name=None,
+        ):
+            cleaned_values = []
+
+            for value in values:
+                if value is None:
+                    cleaned_values.append(None)
                 elif isinstance(value, (pd.Timestamp, datetime, date)):
-                    cleaned_row.append(value.to_pydatetime() if isinstance(value, pd.Timestamp) else value)
+                    cleaned_values.append(
+                        value.to_pydatetime()
+                        if isinstance(value, pd.Timestamp)
+                        else value
+                    )
+                elif pd.isna(value):
+                    cleaned_values.append(None)
                 elif hasattr(value, "item"):
                     try:
-                        cleaned_row.append(value.item())
+                        cleaned_values.append(value.item())
                     except Exception:
-                        cleaned_row.append(value)
+                        cleaned_values.append(value)
                 else:
-                    cleaned_row.append(value)
-            ws.append(cleaned_row)
+                    cleaned_values.append(value)
+
+            ws.append(cleaned_values)
 
         style_worksheet(ws)
-        return ws
 
-    # Main summary sheet.
+    # Summary sheet.
     ws = workbook.create_sheet("Auto Summary")
-    ws.append(["AI AUDIT VERIFICATION — SAMPLING SUMMARY"])
+    ws.append(["AI AUDIT VERIFICATION - SAMPLING SUMMARY"])
     ws.append(["Ledger transactions analysed", len(ledger)])
     ws.append(["Full-verification transactions", len(full)])
     ws.append(["Risk-based sample transactions", len(selected)])
-    ws.append(["Remaining unsampled transactions", len(not_selected)])
-    ws.append(["Sampling percentage for other heads", sample_percentage])
-    ws.append(["Selection method", "Full verification keywords + within-head sample"])
+    ws.append(["Unselected population transactions", len(not_selected)])
+    ws.append(["Sampling percentage", sample_percentage])
     ws.append([
-        "Important",
-        "Review the detected fields and full-verification classifications before relying on this workbook."
+        "Selection method",
+        "Keyword-based full verification and percentage-based sampling",
     ])
-    ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
-    ws["A1"].fill = PatternFill(fill_type="solid", fgColor="17365D")
+    ws.append([
+        "Review note",
+        "Review classifications and selected items before audit use.",
+    ])
+
+    ws["A1"].font = Font(
+        bold=True,
+        color="FFFFFF",
+        size=14,
+    )
+    ws["A1"].fill = PatternFill(
+        fill_type="solid",
+        fgColor="17365D",
+    )
     ws.merge_cells("A1:B1")
     ws.column_dimensions["A"].width = 38
     ws.column_dimensions["B"].width = 90
+
     for row in ws.iter_rows():
         for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
 
     add_dataframe_sheet(
         "100% Verification",
@@ -620,11 +680,13 @@ def build_audit_sampling_workbook(
             ["_Full_Verification_Category", "_Audit_Account"]
         ) if not full.empty else full,
     )
+
     add_dataframe_sheet("Sample Selected", selected)
     add_dataframe_sheet("Population Summary", summary)
     add_dataframe_sheet("Unselected Population", not_selected)
 
     detection_rows = []
+
     for field, details in detected.items():
         detection_rows.append({
             "Field": field.replace("_", " ").title(),
@@ -634,7 +696,9 @@ def build_audit_sampling_workbook(
                 else "Not detected"
             ),
             "Confidence Score": details["score"],
-            "Review Required": "Yes" if details["ambiguous"] else "No",
+            "Review Required": (
+                "Yes" if details["ambiguous"] else "No"
+            ),
         })
 
     add_dataframe_sheet(
@@ -646,11 +710,16 @@ def build_audit_sampling_workbook(
     workbook.save(output)
     output.seek(0)
 
-    return output.getvalue(), detected, len(full), len(selected)
+    return (
+        output.getvalue(),
+        detected,
+        len(full),
+        len(selected),
+    )
 
 
 # ============================================================
-# USER INTERFACE
+# STREAMLIT INTERFACE
 # ============================================================
 
 st.header("1. Upload Files")
@@ -676,17 +745,20 @@ ledger_df = None
 if ledger_file is not None:
     try:
         ledger_df = read_uploaded_ledger(ledger_file)
+
         st.success(
             f"Ledger loaded: {len(ledger_df):,} rows and "
             f"{len(ledger_df.columns):,} columns."
         )
+
         with st.expander("Preview General Ledger"):
             st.dataframe(
                 ledger_df.head(10),
                 use_container_width=True,
             )
+
     except Exception as exc:
-        st.error(f"Could not read the General Ledger: {exc}")
+        st.error(f"Could not read the ledger: {exc}")
 
 if reference_file is not None:
     st.success(
@@ -703,6 +775,7 @@ if ledger_df is not None and not ledger_df.empty:
         )
 
         detection_rows = []
+
         for field, details in detected_columns.items():
             detection_rows.append({
                 "Field": field.replace("_", " ").title(),
@@ -728,8 +801,8 @@ if ledger_df is not None and not ledger_df.empty:
         )
 
         st.caption(
-            "Column detection is automatic. Check ambiguous or missing "
-            "fields before using the workbook for audit evidence."
+            "Dates are parsed with timezone normalisation to prevent "
+            "mixed-timezone errors."
         )
 
         with st.expander("Review detected account heads"):
@@ -739,6 +812,7 @@ if ledger_df is not None and not ledger_df.empty:
                 .rename_axis("Account Head")
                 .reset_index(name="Transaction Count")
             )
+
             st.dataframe(
                 heads_preview,
                 use_container_width=True,
@@ -766,14 +840,14 @@ if ledger_df is not None and not ledger_df.empty:
             )
 
         st.write(
-            "**Automatic full-verification categories:** Utilities; "
-            "Fee and Subscription; Legal and Professional Charges; "
-            "Salaries; Depreciation."
+            "**Full-verification categories:** Utilities, Fee and "
+            "Subscription, Legal and Professional Charges, Salaries, "
+            "and Depreciation."
         )
 
         st.caption(
-            "These categories are identified using account-name keywords. "
-            "Review the classifications because account titles vary between clients."
+            "Categories are matched using account-name keywords. "
+            "Review the classification against your audit plan."
         )
 
         if st.button(
@@ -783,11 +857,13 @@ if ledger_df is not None and not ledger_df.empty:
         ):
             if reference_file is None:
                 st.error(
-                    "Upload the reference sampling workbook before generating."
+                    "Please upload the reference sampling workbook."
                 )
             else:
                 try:
-                    with st.spinner("Preparing the audit sampling workbook..."):
+                    with st.spinner(
+                        "Generating the audit sampling workbook..."
+                    ):
                         excel_bytes, detected, full_count, sample_count = (
                             build_audit_sampling_workbook(
                                 ledger_df=ledger_df,
@@ -798,13 +874,12 @@ if ledger_df is not None and not ledger_df.empty:
                         )
 
                     st.success(
-                        f"Workbook created. Full-verification items: "
-                        f"{full_count:,}; risk-based sample items: "
-                        f"{sample_count:,}."
+                        f"Workbook generated. Full-verification items: "
+                        f"{full_count:,}; sampled items: {sample_count:,}."
                     )
 
                     st.download_button(
-                        label="Download Audit Sampling Workbook",
+                        "Download Audit Sampling Workbook",
                         data=excel_bytes,
                         file_name="Audit_Sampling_Workbook.xlsx",
                         mime=(
@@ -821,7 +896,9 @@ if ledger_df is not None and not ledger_df.empty:
                     )
 
     except Exception as exc:
-        st.error(f"Automatic ledger analysis failed: {exc}")
+        st.error(
+            f"Automatic ledger analysis failed: {exc}"
+        )
 
 else:
     st.info(
@@ -829,7 +906,8 @@ else:
     )
 
 st.divider()
+
 st.caption(
-    "AI Audit Verification | Generated samples are audit aids, not a "
-    "substitute for professional judgement or review of the source records."
+    "AI Audit Verification | Always review the selected population "
+    "and supporting evidence before relying on audit results."
 )
